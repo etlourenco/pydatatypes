@@ -236,7 +236,7 @@ class u64_t(int_t):
 
 
 # TODO: >>>>>>>>>>>>>>>>>>>>>> bitfields <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
-# TODO: >>>>>>>>>>>>>>>>>>>>>> arrays <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
 
 
 
@@ -266,14 +266,14 @@ class struct_t(data_t):
     @classmethod
     @cache
     def sizeof(cls) -> int:
-        name, t = list(cls._members().items())[-1]
+        name, t = list(cls._member_types().items())[-1]
         non_padded_size = cls._member_offsets()[name] + t.sizeof()
         return non_padded_size if cls._is_packed else non_padded_size + (cls.alignof() - (non_padded_size % cls.alignof())) % cls.alignof()
 
     @classmethod
     @cache
     def alignof(cls) -> int:
-        return 1 if cls._is_packed else max(t.alignof() for t in cls._members().values())
+        return 1 if cls._is_packed else max(t.alignof() for t in cls._member_types().values())
 
     @classmethod
     @cache
@@ -283,7 +283,7 @@ class struct_t(data_t):
     # helpers
     @classmethod
     @cache
-    def _members(cls) -> dict[str, type[data_t]]:
+    def _member_types(cls) -> dict[str, type[data_t]]:
         return {name: value for name, value in vars(cls).items() if isinstance(value, type) and issubclass(value, data_t)}
 
     @classmethod
@@ -295,12 +295,12 @@ class struct_t(data_t):
             member_offset = offset if cls._is_packed else offset + (member_t.alignof() - (offset % member_t.alignof())) % member_t.alignof()
             offset = member_offset + member_t.sizeof()
             return member_offset  
-        return {name: get_incremental_offset(t) for name, t in cls._members().items()}
+        return {name: get_incremental_offset(t) for name, t in cls._member_types().items()}
 
     # instance (object) methods
     def __init__(self, addr: data_addr, mgr: data_manager) -> None:
         super().__init__(addr, mgr)
-        for name, t in self._members().items():
+        for name, t in self._member_types().items():
             setattr(self, name, t(data_addr_offset(self.addressof(), self.offsetof(name)), mgr))
 
 
@@ -346,9 +346,14 @@ class my_struct_2(struct_t):
 
 
 # instanciate a concrete pointer type to defined "ptr_type"
+ptr_cache: dict[type[generic_data_t], type[base_ptr_t[generic_data_t]]] = dict()
 # @cache # this seems to screw up type annotation, keep commented for now
 def ptr_(ptr_type: type[generic_data_t]) -> type[base_ptr_t[generic_data_t]]:
-    return type(f"ptr_{ptr_type.__name__}", (base_ptr_t,), dict(_ptr_type=ptr_type))
+    try:
+        return ptr_cache[ptr_type]
+    except KeyError:
+        ptr_cache[ptr_type] = type(f"ptr_{ptr_type.__name__}", (base_ptr_t,), dict(_ptr_type=ptr_type))
+        return ptr_cache[ptr_type]
 
 class intptr_t(int_t):
     _size = 8
@@ -363,6 +368,62 @@ class base_ptr_t(intptr_t, Generic[generic_data_t]):
 
     def dereference(self) -> generic_data_t:
         return self._ptr_type(self.read_value(), self._mgr)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# instanciate a concrete array type of "_element_type" and "_length"
+array_cache: dict[tuple[type[generic_data_t], int], type[base_array_t[generic_data_t]]] = dict()
+# @cache # this will likely screw-up type annotation as in pointer
+def array_(elem_type: type[generic_data_t], len: int) -> type[base_array_t[generic_data_t]]:
+    try:
+        return array_cache[(elem_type, len)]
+    except KeyError:
+        array_cache[(elem_type, len)] = type(f"array_{elem_type.__name__}_{len}", (base_array_t,), dict(_element_type=elem_type, _length=len))
+        return array_cache[(elem_type, len)]
+
+# template array class of generic type "_element_type" and length "_length"
+class base_array_t(data_t, Generic[generic_data_t]):
+    _element_type: type[generic_data_t]
+    _length: int
+
+    # type (class) methods
+    @classmethod
+    @cache
+    def sizeof(cls) -> int:
+        return cls._element_type.sizeof() * cls._length
+
+    @classmethod
+    @cache
+    def alignof(cls) -> int:
+        return cls._element_type.alignof()
+
+    # instance (object) methods
+    def __init__(self, addr: data_addr, mgr: data_manager) -> None:
+        assert hasattr(self, "_element_type"), 'Cannot instantiate directly "base_array_t" without defined "_element_type". Use "XXX(element_type, length)(addr, mgr)" to instantiate array of type "element_type".'
+        assert hasattr(self, "_length"), 'Cannot instantiate directly "base_array_t" without defined "_length". Use "XXX(ptr_type)(element_type, length)" to instantiate array of "length".'
+        super().__init__(addr, mgr)
+        self._elements = [self._element_type(data_addr_offset(self.addressof(), i * self._element_type.sizeof()), mgr) for i in range(self._length)]
+
+    def __getitem__(self, i: int) -> generic_data_t:
+        return self._elements[i]
+    
+
+
+
+
+
 
 
 
