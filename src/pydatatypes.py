@@ -12,13 +12,20 @@
 #
 from __future__ import annotations
 
-from dataclasses import dataclass
 from abc import ABC, abstractmethod
 from functools import cache
-from typing import Generic, TypeVar, Any, Callable
+from typing import Generic, TypeVar, Any
 
 
 
+
+
+#
+#
+#   CACHE SEEMS TO BE SCREWING-UP TYPE ANNOTATION FOR BITFIELD, ARRAY AND POINTER TYPE FACTORIES.
+#   NEED TO DEFINE METHODS FOR ITERATING ON STRUCTURES, LOOKS LIKE SHOULD BE SOMEWHAT SIMILAR TO PYTHON DICT'S
+#
+#
 
 
 
@@ -215,6 +222,7 @@ class u32_t(int_t):
 class u64_t(int_t):
     _size = 8
 
+generic_int_t = TypeVar("generic_int_t", bound=int_t)
 
 
 
@@ -235,7 +243,72 @@ class u64_t(int_t):
 
 
 
-# TODO: >>>>>>>>>>>>>>>>>>>>>> bitfields <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+
+
+
+# instanciate a concrete bitfield type of underlying_type and "_bit_length"
+bitfield_cache: dict[tuple[type[generic_int_t], int], type[base_bitfield_t[generic_int_t, int]]] = dict()
+
+def bitfield_(underlying_type: type[generic_int_t], bit_len: int) -> type[base_bitfield_t[generic_int_t, int]]:
+    try:
+        return bitfield_cache[(underlying_type, bit_len)]
+    except KeyError:
+        bitfield_cache[(underlying_type, bit_len)] = type(f"bitfield_{underlying_type.__name__}_{bit_len}", (base_bitfield_t,), dict(_size=underlying_type._size, _bit_length=bit_len))
+        return bitfield_cache[(underlying_type, bit_len)]
+
+class base_bitfield_t(int_t, Generic[generic_int_t]):
+    _bit_length: int
+
+    # type (class) methods
+    @classmethod
+    @cache
+    def bit_length(cls) -> int:
+        return cls._bit_length
+
+    # instance (object) methods
+    def __init__(self, addr: data_addr, mgr: data_manager) -> None:
+        super().__init__(addr, mgr)
+
+class base_bitfield_group_t(int_t):
+    _members: dict[str, type[base_bitfield_t]]
+    _group_counter: int = 0
+
+    @classmethod
+    def add_member(cls, member_name: str, member_type: type[base_bitfield_t]) -> type[base_bitfield_group_t]:
+        if cls == base_bitfield_group_t or cls._size != member_type._size or ((cls._size * 8) - sum(m.bit_length() for m in cls._members.values())) < member_type.bit_length():
+            group = type(
+                f"bitfield_group_{base_bitfield_group_t._group_counter}_t",
+                (base_bitfield_group_t,),
+                dict(_size=member_type._size, _members={member_name:member_type})
+            )
+            base_bitfield_group_t._group_counter += 1
+            return group
+        else:
+            cls._members[member_name] = member_type
+            return cls
+
+    # instance (object) methods
+    def __init__(self, addr: data_addr, mgr: data_manager) -> None:
+        super().__init__(addr, mgr)
+        self._instances = {name: t(self.addressof(), mgr) for name, t in self._members.items()}
+
+    def instances(self) -> dict[str, base_bitfield_t]: # TODO: see top
+        return self._instances
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -281,10 +354,45 @@ class struct_t(data_t):
         return cls._member_offsets()[member]
 
     # helpers
+    # @classmethod
+    # @cache
+    # def _create_member_attributtes_from_annotations(cls) -> None:
+    #     for name, typename in cls.__annotations__.items():
+    #         typename_args = [s for s in re.split(r'[\[\], ]', typename) if s]
+    #         if len(typename_args) < 2:
+    #             setattr(cls, name, globals()[typename])
+    #         else:
+    #             match typename_args[0]:
+    #                 case 'base_bitfield_t':
+    #                     setattr(cls, name, bitfield_(*typename_args[1:]))
+    #                 case 'base_ptr_t':
+    #                     setattr(cls, name, ptr_(*typename_args[1:]))
+    #                 case 'base_array_t':
+    #                     setattr(cls, name, array_(*typename_args[1:]))
+    #                 case _:
+    #                     raise Exception("WRONG!!")
+
     @classmethod
     @cache
     def _member_types(cls) -> dict[str, type[data_t]]:
-        return {name: value for name, value in vars(cls).items() if isinstance(value, type) and issubclass(value, data_t)}
+        # cls._create_member_attributtes_from_annotations()
+        member_types: dict[str, type[data_t]] = dict()
+        bitfield_group = base_bitfield_group_t
+        for name, value in vars(cls).items():
+            if isinstance(value, type) and issubclass(value, data_t):
+                if not issubclass(value, base_bitfield_t):
+                    if bitfield_group != base_bitfield_group_t:
+                        member_types[bitfield_group.__name__] = bitfield_group
+                        bitfield_group = base_bitfield_group_t
+                    member_types[name] = value
+                else:
+                    new_group = bitfield_group.add_member(name, value)
+                    if new_group != bitfield_group and bitfield_group != base_bitfield_group_t:
+                        member_types[bitfield_group.__name__] = bitfield_group
+                    bitfield_group = new_group
+        if bitfield_group != base_bitfield_group_t:
+            member_types[bitfield_group.__name__] = bitfield_group
+        return member_types
 
     @classmethod
     @cache
@@ -300,8 +408,14 @@ class struct_t(data_t):
     # instance (object) methods
     def __init__(self, addr: data_addr, mgr: data_manager) -> None:
         super().__init__(addr, mgr)
+        self.bitfield_group_instances: dict[str, base_bitfield_group_t] = dict()
         for name, t in self._member_types().items():
-            setattr(self, name, t(data_addr_offset(self.addressof(), self.offsetof(name)), mgr))
+            if not issubclass(t, base_bitfield_group_t):
+                setattr(self, name, t(data_addr_offset(self.addressof(), self.offsetof(name)), mgr))
+            else:
+                self.bitfield_group_instances[name] = t(data_addr_offset(self.addressof(), self.offsetof(name)), mgr) # is this needed or bitfield instances maybe should only have their group type?
+                for bitfield_name, bitfield_t in self.bitfield_group_instances[name].instances().items():
+                    setattr(self, bitfield_name, bitfield_t)
 
 
 #
@@ -318,7 +432,7 @@ class struct_t(data_t):
 
 
 #
-#   DECORATOR FOR STRUCT DOESN'T SEEM GOOD
+#   INHERITANCE FOR STRUCT DOESN'T SEEM GOOD
 #       PROS: INHERITS FROM STRUCT_T (WITH ALL INTERFACE) ADDING MEMBER DEFINITIONS AS ONE-LINERS
 #       CONS: LITTLE CONVOLUTED/REPEATED SYNTAX ON MEMBER DEFINITIONS
 #
@@ -329,8 +443,12 @@ class my_struct_1(struct_t):
     _bbb: u32_t = u32_t
     _aaa: u16_t = u16_t
 
-class my_struct_2(struct_t):
-    pass
+
+
+
+
+
+
 
 
 
@@ -347,7 +465,7 @@ class my_struct_2(struct_t):
 
 # instanciate a concrete pointer type to defined "ptr_type"
 ptr_cache: dict[type[generic_data_t], type[base_ptr_t[generic_data_t]]] = dict()
-# @cache # this seems to screw up type annotation, keep commented for now
+
 def ptr_(ptr_type: type[generic_data_t]) -> type[base_ptr_t[generic_data_t]]:
     try:
         return ptr_cache[ptr_type]
@@ -383,15 +501,23 @@ class base_ptr_t(intptr_t, Generic[generic_data_t]):
 
 
 
+
+
+
+
+
+
+
+
 # instanciate a concrete array type of "_element_type" and "_length"
 array_cache: dict[tuple[type[generic_data_t], int], type[base_array_t[generic_data_t]]] = dict()
-# @cache # this will likely screw-up type annotation as in pointer
-def array_(elem_type: type[generic_data_t], len: int) -> type[base_array_t[generic_data_t]]:
+
+def array_(elem_type: type[generic_data_t], array_len: int) -> type[base_array_t[generic_data_t]]:
     try:
-        return array_cache[(elem_type, len)]
+        return array_cache[(elem_type, array_len)]
     except KeyError:
-        array_cache[(elem_type, len)] = type(f"array_{elem_type.__name__}_{len}", (base_array_t,), dict(_element_type=elem_type, _length=len))
-        return array_cache[(elem_type, len)]
+        array_cache[(elem_type, array_len)] = type(f"array_{elem_type.__name__}_{array_len}", (base_array_t,), dict(_element_type=elem_type, _length=array_len))
+        return array_cache[(elem_type, array_len)]
 
 # template array class of generic type "_element_type" and length "_length"
 class base_array_t(data_t, Generic[generic_data_t]):
@@ -430,14 +556,18 @@ class base_array_t(data_t, Generic[generic_data_t]):
 
 
 
+class my_strcut_2(struct_t):
+    _aa: u8_t = u8_t
+    _bb0: base_bitfield_t[u16_t] = bitfield_(u16_t, 10)
+    _bb1: base_bitfield_t[u16_t] = bitfield_(u16_t, 4)
+    _bb2: base_bitfield_t[u16_t] = bitfield_(u16_t, 2)
+    _cc: u8_t = u8_t
+    # _dd: base_array_t[u8_t] = array_(u8_t, 10)
+    # _ee: base_ptr_t[u8_t] = ptr_(u8_t)
 
 
-
-
-
-
-
-
+aa = my_strcut_2(None, None)
+bb = my_strcut_2(None, None)
 
 
 
